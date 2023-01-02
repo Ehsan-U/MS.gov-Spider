@@ -1,8 +1,8 @@
-import json
-import scrapy
-from ..items import ProjectMsgovItem
-from scrapy.loader import ItemLoader
-
+from scrapy.crawler import CrawlerProcess
+import json, scrapy
+from isodate import parse_datetime
+import datetime
+import logging
 
 class MsgovSpider(scrapy.Spider):
     name = 'msgov_spider'
@@ -21,11 +21,11 @@ class MsgovSpider(scrapy.Spider):
     def parse(self, response):
         body = response.body
         data = json.loads(body)
-        for contract in data.get("aaData")[:5]:
+        for contract in data.get("aaData"):
             id_ = contract.get("ContractID")
             url = f'https://www.ms.gov/dfa/contract_bid_search/Contract/Details/{id_}?AppId=1'
             yield scrapy.Request(url, callback=self.parse_contract)
-    
+
     def parse_contract(self, response):
         sel = scrapy.Selector(text=response.text)
 
@@ -39,36 +39,37 @@ class MsgovSpider(scrapy.Spider):
             "email":sel.xpath("//span[@id='lblContactEmail']/text()").get(),
             "phone":sel.xpath("//span[@id='lblContactPhone']/text()").get()
         }
-        supplier_contacts = {"address":"".join(sel.xpath("//span[@id='lblPrimaryVendorAddress']/text()").getall())}
+        supplier_contacts = [{"address":"".join(sel.xpath("//span[@id='lblPrimaryVendorAddress']/text()").getall())}]
         contract_type,cooperative_language = self.decide_type(sel)
         scraped_offerings_list = sel.xpath("//span[@id='lblContractItems']/following-sibling::table/tbody/tr[position()>2]/td[5]/text()").getall()
         category_data = {
             'nigp':sel.xpath("//span[@id='lblContractItems']/following-sibling::table/tbody/tr[position()>2]/td[3]/text()").getall()
         }
 
-        loader = ItemLoader(item=ProjectMsgovItem(), response=response, selector=sel)
-        loader.add_value("buyer_lead_agency", "State of Mississippi")
-        loader.add_value("source_key", "state-of-mississippi")
-        loader.add_value("buyer_lead_agency_state", "MS",)
-        loader.add_value("service_area_national", False)
-        loader.add_value("service_area_state", ["MS"])
-        loader.add_value("suppliers", suppliers)
-        loader.add_value("title", title)
-        loader.add_value("contract_number", contract_number)
-        loader.add_value("effective", effective)
-        loader.add_value("expiration", expiration)
-        loader.add_value("source_url", source_url)
-        loader.add_value("buyer_contacts", buyer_contacts)
-        loader.add_value("supplier_contacts", supplier_contacts)
-        loader.add_value("contract_type", contract_type)
-        loader.add_value("cooperative_language", cooperative_language)
+        item = {
+            "buyer_lead_agency":"State of Mississippi",
+            "source_key":"state-of-mississippi",
+            "buyer_lead_agency_state":"MS",
+            "service_area_national":False,
+            "service_area_state":["MS"],
+            "suppliers":self.clean(suppliers),
+            "title": self.clean(title),
+            "contract_number": self.clean(contract_number),
+            "effective": self.isoformat(effective),
+            "expiration": self.isoformat(expiration),
+            "source_url": self.clean(source_url),
+            "buyer_contacts": buyer_contacts,
+            "supplier_contacts": self.clean(supplier_contacts),
+            "contract_type": contract_type,
+            "cooperative_language": cooperative_language,
+        }
         files = self.decide_filetype(sel)
-        for k,val in files.items():
-            loader.add_value(k, val)
-        loader.add_value("scraped_offerings_list", scraped_offerings_list)
-        loader.add_value("category_data", category_data)
-
-        yield loader.load_item()
+        for k,v in files.items():
+            item[k] = self.verify_files(v)
+        item['scraped_offerings_list'] = scraped_offerings_list
+        item['category_data'] = category_data
+        item = self.remove_null(item)
+        yield item
 
     def decide_type(self, sel):
         contract_category = sel.xpath("//span[@id='lblContractCategory']/text()").get()
@@ -106,11 +107,16 @@ class MsgovSpider(scrapy.Spider):
             for k,vals in self.mappings.items():
                 for v in vals:
                     if v in f_text.lower():
-                        files[k].append({'name':f_text,"url":f_link})
-                        type_found = True
-            if not type_found:     
+                        if k == 'contract_files':
+                            if not "renewal" in f_text:
+                                files[k].append({'name':f_text,"url":f_link})
+                                type_found = True
+                        else:
+                            files[k].append({'name': f_text, "url": f_link})
+                            type_found = True
+            if not type_found:
                 files['other_docs_files'].append(f)
-        return files        
+        return files
 
     def prepare_payload(self):
         payload = {}
@@ -119,3 +125,46 @@ class MsgovSpider(scrapy.Spider):
             item = item.split("=")
             payload[item[0]] = item[-1]
         return payload
+
+    def clean(self, data):
+        if data:
+            if type(data) == list:
+                address = data[0]['address'].replace(u"\xa0", u'').strip()
+                data[0]['address'] = address
+            else:
+                data = data.strip().replace(u"\xa0",u'')
+        else:
+            data = ''
+        return data
+
+    def verify_files(self, iterr):
+        if iterr:
+            pass
+        else:
+            iterr = ''
+        return iterr
+
+    def verify_category(self, dictt):
+        if dictt['nigp']:
+            pass
+        else:
+            dictt = ''
+        return dictt
+    def isoformat(self, string):
+        if string:
+            isoformatted = parse_datetime(datetime.datetime.strptime(string.strip(), "%m/%d/%Y").isoformat())
+        else:
+            isoformatted = ''
+        return isoformatted
+
+    def remove_null(self, item):
+        return {k:v for k,v in item.items() if v}
+
+
+crawler = CrawlerProcess(settings={
+    "FEEDS":{"data.json":{"format":"json"}},
+    "REQUEST_FINGERPRINTER_IMPLEMENTATION": '2.7',
+    "LOG_LEVEL":logging.DEBUG
+})
+crawler.crawl(MsgovSpider)
+crawler.start(stop_after_crawl=True)
